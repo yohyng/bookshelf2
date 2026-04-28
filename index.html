@@ -1,0 +1,1157 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+
+/*
+Supabase schema for this app
+
+1) Create these tables in Supabase SQL Editor.
+2) Enable Row Level Security.
+3) Add the policies below.
+4) Add these env vars to your web app:
+   VITE_SUPABASE_URL=https://xxxxx.supabase.co
+   VITE_SUPABASE_ANON_KEY=your-anon-public-key
+
+create table if not exists public.books (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null default auth.uid(),
+  title text not null,
+  author text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.quotes (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null default auth.uid(),
+  book_id uuid not null references public.books(id) on delete cascade,
+  transcription text not null,
+  page_number text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+alter table public.books enable row level security;
+alter table public.quotes enable row level security;
+
+create policy "books select own" on public.books for select using (auth.uid() = user_id);
+create policy "books insert own" on public.books for insert with check (auth.uid() = user_id);
+create policy "books update own" on public.books for update using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy "books delete own" on public.books for delete using (auth.uid() = user_id);
+
+create policy "quotes select own" on public.quotes for select using (auth.uid() = user_id);
+create policy "quotes insert own" on public.quotes for insert with check (auth.uid() = user_id);
+create policy "quotes update own" on public.quotes for update using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy "quotes delete own" on public.quotes for delete using (auth.uid() = user_id);
+
+create index if not exists books_user_updated_idx on public.books(user_id, updated_at desc);
+create index if not exists quotes_user_book_created_idx on public.quotes(user_id, book_id, created_at desc);
+*/
+
+const ENV = typeof import.meta !== "undefined" && import.meta.env ? import.meta.env : {};
+const SUPABASE_URL = ENV.VITE_SUPABASE_URL || "";
+const SUPABASE_ANON_KEY = ENV.VITE_SUPABASE_ANON_KEY || "";
+const HAS_SUPABASE_CONFIG = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+const SESSION_KEY = "shiori_supabase_session_v1";
+const LOCAL_BOOKS_KEY = "shiori_local_books_v1";
+const THEME_KEY = "shiori_theme_v1";
+const HIGHLIGHT_ROTATION_MS = 5 * 60 * 1000;
+
+const sampleBooks = [
+  {
+    id: "book-1",
+    title: "ありふれたものの変容",
+    author: "アーサー・C・ダントー",
+    createdAt: new Date(Date.now() - 1000 * 60 * 60 * 24 * 5).toISOString(),
+    updatedAt: new Date(Date.now() - 1000 * 60 * 60 * 3).toISOString(),
+    quotes: [
+      {
+        id: "quote-1",
+        transcription:
+          "芸術作品であることは、物質的な属性だけではなく、**それを読み解く文脈**によって成立する。",
+        pageNumber: "42",
+        createdAt: new Date(Date.now() - 1000 * 60 * 60 * 3).toISOString(),
+        updatedAt: new Date(Date.now() - 1000 * 60 * 60 * 3).toISOString(),
+      },
+      {
+        id: "quote-2",
+        transcription: "同じ“もの”であっても、置かれる枠組みによって意味は一変する。",
+        pageNumber: "87",
+        createdAt: new Date(Date.now() - 1000 * 60 * 60 * 24 * 2).toISOString(),
+        updatedAt: new Date(Date.now() - 1000 * 60 * 60 * 24 * 2).toISOString(),
+      },
+    ],
+  },
+  {
+    id: "book-2",
+    title: "普通のデザイン",
+    author: "内田繁",
+    createdAt: new Date(Date.now() - 1000 * 60 * 60 * 24 * 9).toISOString(),
+    updatedAt: new Date(Date.now() - 1000 * 60 * 60 * 24).toISOString(),
+    quotes: [
+      {
+        id: "quote-3",
+        transcription:
+          "日本の室内の特性は、**空なる場**である。必要に応じて、さまざまな変化がつくり出される。",
+        pageNumber: "128",
+        createdAt: new Date(Date.now() - 1000 * 60 * 60 * 24).toISOString(),
+        updatedAt: new Date(Date.now() - 1000 * 60 * 60 * 24).toISOString(),
+      },
+    ],
+  },
+];
+
+function uid(prefix = "id") {
+  return `${prefix}-${Math.random().toString(36).slice(2)}-${Date.now()}`;
+}
+
+function toCamelBook(row) {
+  return {
+    id: row.id,
+    title: row.title,
+    author: row.author || "",
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    quotes: [],
+  };
+}
+
+function toCamelQuote(row) {
+  return {
+    id: row.id,
+    bookId: row.book_id,
+    transcription: row.transcription,
+    pageNumber: row.page_number || "",
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function flattenQuotes(books) {
+  return books.flatMap((book) =>
+    (book.quotes || []).map((quote) => ({
+      ...quote,
+      bookId: book.id,
+      bookTitle: book.title,
+      bookAuthor: book.author,
+    }))
+  );
+}
+
+function csvEscape(value) {
+  return `"${String(value ?? "").replace(/"/g, '""')}"`;
+}
+
+function buildCSV(books) {
+  let csvContent = "\uFEFFBook Title,Author,Page,Quote,Created At\n";
+  books.forEach((book) => {
+    (book.quotes || []).forEach((quote) => {
+      const row = [
+        book.title,
+        book.author || "",
+        quote.pageNumber || "",
+        (quote.transcription || "").replace(/\*\*/g, ""),
+        new Date(quote.createdAt).toLocaleString(),
+      ].map(csvEscape);
+      csvContent += row.join(",") + "\n";
+    });
+  });
+  return csvContent;
+}
+
+function parseCSVLine(line) {
+  const result = [];
+  let current = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i += 1) {
+    const char = line[i];
+    const next = line[i + 1];
+    if (char === '"' && inQuotes && next === '"') {
+      current += '"';
+      i += 1;
+    } else if (char === '"') {
+      inQuotes = !inQuotes;
+    } else if (char === "," && !inQuotes) {
+      result.push(current);
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+  result.push(current);
+  return result;
+}
+
+function parseCSV(text) {
+  const cleaned = text.replace(/^\uFEFF/, "");
+  const lines = cleaned.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  if (lines.length === 0) return [];
+
+  const headers = parseCSVLine(lines[0]).map((header) => header.trim());
+  return lines.slice(1).map((line) => {
+    const values = parseCSVLine(line);
+    return headers.reduce((row, header, index) => {
+      row[header] = values[index] ?? "";
+      return row;
+    }, {});
+  });
+}
+
+function getFirstValue(row, keys) {
+  const normalized = Object.entries(row).reduce((acc, [key, value]) => {
+    acc[key.trim().toLowerCase()] = value;
+    return acc;
+  }, {});
+  for (const key of keys) {
+    const value = normalized[key.toLowerCase()];
+    if (value !== undefined && String(value).trim() !== "") return String(value).trim();
+  }
+  return "";
+}
+
+function normalizeImportedRows(rows) {
+  return rows
+    .map((row) => ({
+      title: getFirstValue(row, ["Book Title", "Title", "book", "書名", "タイトル", "本"]),
+      author: getFirstValue(row, ["Author", "著者", "作者"]),
+      pageNumber: getFirstValue(row, ["Page", "page", "pageNumber", "page_number", "ページ", "頁"]),
+      transcription: getFirstValue(row, ["Quote", "Transcription", "Text", "Body", "本文", "引用", "抜粋", "メモ"]),
+      createdAt: getFirstValue(row, ["Created At", "created_at", "createdAt", "Date", "日付", "作成日"]),
+    }))
+    .filter((row) => row.title && row.transcription);
+}
+
+function safeDateISOString(value) {
+  if (!value) return new Date().toISOString();
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
+}
+
+function toggleMarkdownBold(text, start, end) {
+  if (start === end) return text;
+  const selectedText = text.substring(start, end);
+  const wrapped =
+    selectedText.startsWith("**") && selectedText.endsWith("**")
+      ? selectedText.slice(2, -2)
+      : `**${selectedText}**`;
+  return text.substring(0, start) + wrapped + text.substring(end);
+}
+
+function groupBooksAndQuotes(bookRows, quoteRows) {
+  const books = bookRows.map(toCamelBook);
+  const byId = new Map(books.map((book) => [book.id, book]));
+  quoteRows.map(toCamelQuote).forEach((quote) => {
+    const book = byId.get(quote.bookId);
+    if (book) book.quotes.push(quote);
+  });
+  books.forEach((book) => {
+    book.quotes.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  });
+  return books;
+}
+
+function pickNextQuote(quotes, currentId) {
+  if (quotes.length === 0) return null;
+  if (quotes.length === 1) return quotes[0];
+  const candidates = quotes.filter((quote) => quote.id !== currentId);
+  return candidates[Math.floor(Math.random() * candidates.length)];
+}
+
+function runSelfTests() {
+  console.assert(flattenQuotes(sampleBooks).length === 3, "flattenQuotes should return 3 quotes");
+  console.assert(csvEscape('A "quoted" title') === '"A ""quoted"" title"', "csvEscape failed");
+  console.assert(parseCSVLine('"Book, A",Author,"Quote ""x"""').length === 3, "parseCSVLine failed");
+  console.assert(
+    normalizeImportedRows(parseCSV("Book Title,Author,Page,Quote\nA,B,12,C"))[0].title === "A",
+    "normalizeImportedRows failed"
+  );
+  console.assert(toggleMarkdownBold("abcdef", 1, 4) === "a**bcd**ef", "bold toggle add failed");
+  console.assert(toggleMarkdownBold("a**bcd**ef", 1, 8) === "abcdef", "bold toggle remove failed");
+  console.assert(pickNextQuote([], "x") === null, "pickNextQuote empty failed");
+  console.assert(pickNextQuote([{ id: "a" }], "a")?.id === "a", "pickNextQuote single failed");
+  const grouped = groupBooksAndQuotes(
+    [{ id: "b", title: "Book", author: "A", created_at: "2026-01-01", updated_at: "2026-01-01" }],
+    [{ id: "q", book_id: "b", transcription: "Quote", page_number: "1", created_at: "2026-01-02", updated_at: "2026-01-02" }]
+  );
+  console.assert(grouped[0].quotes.length === 1, "groupBooksAndQuotes failed");
+}
+
+async function supabaseAuthFetch(path, body, token) {
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/${path}`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${token || SUPABASE_ANON_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.error_description || data.msg || data.message || "Supabase Auth error");
+  }
+  return data;
+}
+
+async function supabaseDbFetch(path, { method = "GET", token, body, prefer } = {}) {
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    method,
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      ...(prefer ? { Prefer: prefer } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : null;
+  if (!response.ok) throw new Error(data?.message || data?.hint || "Supabase database error");
+  return data;
+}
+
+function readLocalBooks() {
+  try {
+    const stored = window.localStorage.getItem(LOCAL_BOOKS_KEY);
+    return stored ? JSON.parse(stored) : sampleBooks;
+  } catch {
+    return sampleBooks;
+  }
+}
+
+function writeLocalBooks(books) {
+  window.localStorage.setItem(LOCAL_BOOKS_KEY, JSON.stringify(books));
+}
+
+function readInitialTheme() {
+  try {
+    const stored = window.localStorage.getItem(THEME_KEY);
+    if (stored === "light" || stored === "dark") return stored;
+  } catch {
+    // ignore
+  }
+  if (typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: dark)").matches) {
+    return "dark";
+  }
+  return "light";
+}
+
+const iconPaths = {
+  Loader2: <path d="M21 12a9 9 0 1 1-6.2-8.56" />,
+  Camera: (<><path d="M14.5 4h-5L8 6H5a3 3 0 0 0-3 3v8a3 3 0 0 0 3 3h14a3 3 0 0 0 3-3V9a3 3 0 0 0-3-3h-3l-1.5-2z" /><circle cx="12" cy="13" r="3.5" /></>),
+  Save: (<><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" /><path d="M17 21v-8H7v8" /><path d="M7 3v5h8" /></>),
+  Book: (<><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" /><path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5z" /></>),
+  LayoutDashboard: (<><rect width="7" height="9" x="3" y="3" rx="1" /><rect width="7" height="5" x="14" y="3" rx="1" /><rect width="7" height="9" x="14" y="12" rx="1" /><rect width="7" height="5" x="3" y="16" rx="1" /></>),
+  RefreshCw: (<><path d="M21 12a9 9 0 0 0-15.3-6.3L3 8" /><path d="M3 3v5h5" /><path d="M3 12a9 9 0 0 0 15.3 6.3L21 16" /><path d="M16 16h5v5" /></>),
+  ChevronRight: <path d="m9 18 6-6-6-6" />,
+  Bookmark: <path d="M19 21 12 17 5 21V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />,
+  Highlighter: (<><path d="m9 11-6 6v3h9l3-3" /><path d="m22 12-4.6 4.6a2 2 0 0 1-2.8 0L7.4 9.4a2 2 0 0 1 0-2.8L12 2" /><path d="m14 4 6 6" /></>),
+  Sparkles: (<><path d="M9.9 4.2 8.7 7.5 5.4 8.7l3.3 1.2 1.2 3.3 1.2-3.3 3.3-1.2-3.3-1.2-1.2-3.3z" /><path d="M18 12.5 17.2 15l-2.5.8 2.5.8.8 2.5.8-2.5 2.5-.8-2.5-.8-.8-2.5z" /></>),
+  Trash2: (<><path d="M3 6h18" /><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /><path d="M10 11v6" /><path d="M14 11v6" /></>),
+  Clock: (<><circle cx="12" cy="12" r="10" /><path d="M12 6v6l4 2" /></>),
+  History: (<><path d="M3 12a9 9 0 1 0 3-6.7" /><path d="M3 3v6h6" /><path d="M12 7v5l3 2" /></>),
+  Edit3: (<><path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" /></>),
+  Download: (<><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><path d="M7 10l5 5 5-5" /><path d="M12 15V3" /></>),
+  Upload: (<><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><path d="M17 8l-5-5-5 5" /><path d="M12 3v12" /></>),
+  Check: <path d="M20 6 9 17l-5-5" />,
+  AlertCircle: (<><circle cx="12" cy="12" r="10" /><path d="M12 8v4" /><path d="M12 16h.01" /></>),
+  CheckCircle2: (<><circle cx="12" cy="12" r="10" /><path d="m9 12 2 2 4-4" /></>),
+  LogOut: (<><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><path d="M16 17l5-5-5-5" /><path d="M21 12H9" /></>),
+  User: (<><path d="M19 21a7 7 0 0 0-14 0" /><circle cx="12" cy="7" r="4" /></>),
+  Database: (<><ellipse cx="12" cy="5" rx="9" ry="3" /><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5" /><path d="M3 12c0 1.7 4 3 9 3s9-1.3 9-3" /></>),
+  Sun: (<><circle cx="12" cy="12" r="4" /><path d="M12 2v2" /><path d="M12 20v2" /><path d="m4.93 4.93 1.41 1.41" /><path d="m17.66 17.66 1.41 1.41" /><path d="M2 12h2" /><path d="M20 12h2" /><path d="m6.34 17.66-1.41 1.41" /><path d="m19.07 4.93-1.41 1.41" /></>),
+  Moon: (<path d="M21 12.8A8.5 8.5 0 1 1 11.2 3a6.7 6.7 0 0 0 9.8 9.8z" />),
+};
+
+function Icon({ name, className = "w-5 h-5", strokeWidth = 2, fill = "none" }) {
+  return (
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill={fill} stroke="currentColor" strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+      {iconPaths[name] || iconPaths.Book}
+    </svg>
+  );
+}
+
+export default function App() {
+  const [view, setView] = useState("dashboard");
+  const [loading, setLoading] = useState(false);
+  const [books, setBooks] = useState([]);
+  const [selectedBook, setSelectedBook] = useState(null);
+  const [statusMsg, setStatusMsg] = useState(null);
+  const [session, setSession] = useState(null);
+  const [authMode, setAuthMode] = useState("signin");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [theme, setTheme] = useState(readInitialTheme);
+
+  const fileInputRef = useRef(null);
+  const csvInputRef = useRef(null);
+  const textareaRef = useRef(null);
+
+  const [selectedBookId, setSelectedBookId] = useState("new");
+  const [title, setTitle] = useState("");
+  const [author, setAuthor] = useState("");
+  const [transcription, setTranscription] = useState("");
+  const [pageNumber, setPageNumber] = useState("");
+  const [editingQuoteId, setEditingQuoteId] = useState(null);
+  const [dailyQuote, setDailyQuote] = useState(null);
+
+  const isDark = theme === "dark";
+  const isLocalDemo = !HAS_SUPABASE_CONFIG;
+  const accessToken = session?.access_token;
+
+  const ui = {
+    app: isDark ? "bg-slate-950 text-slate-100 selection:bg-indigo-900" : "bg-[#FDFDFF] text-slate-900 selection:bg-indigo-100",
+    header: isDark ? "bg-slate-950/75 border-slate-800/80" : "bg-white/70 border-slate-100/50",
+    panel: isDark ? "bg-slate-900 border-slate-800 shadow-black/25" : "bg-white border-slate-100 shadow-indigo-100/40",
+    soft: isDark ? "bg-slate-800 border-slate-700" : "bg-slate-50 border-slate-100",
+    muted: isDark ? "text-slate-400" : "text-slate-400",
+    subtle: isDark ? "text-slate-500" : "text-slate-300",
+    title: isDark ? "text-slate-50" : "text-slate-900",
+    body: isDark ? "text-slate-200" : "text-slate-800",
+    input: isDark ? "bg-slate-800 border-slate-700 text-slate-100 placeholder:text-slate-500 focus:border-indigo-400" : "bg-slate-50 border-slate-50 text-slate-900 placeholder:text-slate-200 focus:border-indigo-500",
+    highlight: isDark ? "bg-indigo-950 text-indigo-100 border-indigo-700" : "bg-indigo-50 text-indigo-900 border-indigo-200",
+    nav: isDark ? "bg-white/90 border-slate-300" : "bg-slate-900/90 border-white/10",
+    navInactive: isDark ? "text-slate-500 hover:text-slate-900" : "text-slate-500 hover:text-slate-300",
+    navActive: isDark ? "bg-slate-950 text-white shadow-xl" : "bg-white text-slate-900 shadow-xl",
+  };
+
+  useEffect(() => {
+    runSelfTests();
+    if (isLocalDemo) {
+      const localBooks = readLocalBooks();
+      setBooks(localBooks);
+      setSession({ user: { email: "local-demo@shiori" }, access_token: "local-demo" });
+      return;
+    }
+    try {
+      const stored = window.localStorage.getItem(SESSION_KEY);
+      if (stored) setSession(JSON.parse(stored));
+    } catch {
+      window.localStorage.removeItem(SESSION_KEY);
+    }
+  }, [isLocalDemo]);
+
+  useEffect(() => {
+    window.localStorage.setItem(THEME_KEY, theme);
+  }, [theme]);
+
+  useEffect(() => {
+    if (isLocalDemo) writeLocalBooks(books);
+  }, [books, isLocalDemo]);
+
+  useEffect(() => {
+    if (!accessToken || isLocalDemo) return;
+    fetchBooks();
+  }, [accessToken, isLocalDemo]);
+
+  const allQuotes = useMemo(() => flattenQuotes(books), [books]);
+
+  useEffect(() => {
+    if (allQuotes.length === 0) {
+      setDailyQuote(null);
+      return;
+    }
+    setDailyQuote((current) => {
+      if (current && allQuotes.some((quote) => quote.id === current.id)) return current;
+      return allQuotes[0];
+    });
+  }, [allQuotes]);
+
+  useEffect(() => {
+    if (allQuotes.length === 0) return undefined;
+    const intervalId = window.setInterval(() => {
+      setDailyQuote((current) => pickNextQuote(allQuotes, current?.id));
+    }, HIGHLIGHT_ROTATION_MS);
+    return () => window.clearInterval(intervalId);
+  }, [allQuotes]);
+
+  const selectedBookLive = useMemo(() => {
+    if (!selectedBook) return null;
+    return books.find((book) => book.id === selectedBook.id) || selectedBook;
+  }, [books, selectedBook]);
+
+  const showStatus = (text, type = "success") => {
+    setStatusMsg({ text, type });
+    if (type !== "error") window.setTimeout(() => setStatusMsg(null), 2500);
+  };
+
+  const toggleTheme = () => setTheme((current) => (current === "dark" ? "light" : "dark"));
+
+  async function fetchBooks() {
+    setLoading(true);
+    try {
+      const [bookRows, quoteRows] = await Promise.all([
+        supabaseDbFetch("books?select=*&order=updated_at.desc", { token: accessToken }),
+        supabaseDbFetch("quotes?select=*&order=created_at.asc", { token: accessToken }),
+      ]);
+      const grouped = groupBooksAndQuotes(bookRows || [], quoteRows || []);
+      setBooks(grouped);
+    } catch (error) {
+      showStatus(error.message, "error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const handleAuth = async () => {
+    if (!email.trim() || !password.trim()) {
+      showStatus("メールアドレスとパスワードを入力してください", "error");
+      return;
+    }
+    setLoading(true);
+    try {
+      const data = authMode === "signup"
+        ? await supabaseAuthFetch("signup", { email, password })
+        : await supabaseAuthFetch("token?grant_type=password", { email, password });
+      if (!data.access_token) {
+        showStatus("登録確認メールを確認してください。確認後にログインできます。", "success");
+        return;
+      }
+      window.localStorage.setItem(SESSION_KEY, JSON.stringify(data));
+      setSession(data);
+      setEmail("");
+      setPassword("");
+      showStatus(authMode === "signup" ? "登録しました" : "ログインしました");
+    } catch (error) {
+      showStatus(error.message, "error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const logout = () => {
+    window.localStorage.removeItem(SESSION_KEY);
+    setSession(null);
+    setBooks([]);
+    setSelectedBook(null);
+    setDailyQuote(null);
+    setView("dashboard");
+    showStatus("ログアウトしました");
+  };
+
+  const pickRandomQuote = () => {
+    if (allQuotes.length === 0) return;
+    setDailyQuote((current) => pickNextQuote(allQuotes, current?.id));
+    showStatus("新しい一節を表示しました");
+  };
+
+  const handleFileSelect = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const guessedTitle = file.name.replace(/\.[^.]+$/, "").replace(/[-_]/g, " ");
+    setSelectedBookId("new");
+    setTitle(guessedTitle || "");
+    setAuthor("");
+    setPageNumber("");
+    setTranscription("画像は保存しません。OCR後のテキスト、または手入力した本文だけをSupabaseに保存します。");
+    setEditingQuoteId(null);
+    setView("add");
+    if (fileInputRef.current) fileInputRef.current.value = "";
+    showStatus("画像保存なしのテキスト入力モードです");
+  };
+
+  const handleCSVImport = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    setLoading(true);
+    try {
+      const text = await file.text();
+      const rows = normalizeImportedRows(parseCSV(text));
+      if (rows.length === 0) throw new Error("インポートできる行が見つかりませんでした");
+      if (isLocalDemo) {
+        importRowsLocally(rows);
+      } else {
+        await importRowsToSupabase(rows);
+        await fetchBooks();
+      }
+      showStatus(`${rows.length}件のハイライトをインポートしました`);
+      setView("library");
+    } catch (error) {
+      showStatus(error.message, "error");
+    } finally {
+      setLoading(false);
+      if (csvInputRef.current) csvInputRef.current.value = "";
+    }
+  };
+
+  function importRowsLocally(rows) {
+    const now = new Date().toISOString();
+    setBooks((prev) => {
+      const next = prev.map((book) => ({ ...book, quotes: [...(book.quotes || [])] }));
+      const byKey = new Map(next.map((book) => [`${book.title.trim().toLowerCase()}|${(book.author || "").trim().toLowerCase()}`, book]));
+
+      rows.forEach((row) => {
+        const key = `${row.title.trim().toLowerCase()}|${(row.author || "").trim().toLowerCase()}`;
+        let book = byKey.get(key);
+        if (!book) {
+          book = { id: uid("book"), title: row.title, author: row.author, createdAt: now, updatedAt: now, quotes: [] };
+          byKey.set(key, book);
+          next.unshift(book);
+        }
+        const createdAt = safeDateISOString(row.createdAt);
+        book.quotes.push({
+          id: uid("quote"),
+          transcription: row.transcription,
+          pageNumber: row.pageNumber,
+          createdAt,
+          updatedAt: now,
+        });
+        book.updatedAt = now;
+      });
+      return next;
+    });
+  }
+
+  async function importRowsToSupabase(rows) {
+    const now = new Date().toISOString();
+    const existingBooks = new Map(
+      books.map((book) => [`${book.title.trim().toLowerCase()}|${(book.author || "").trim().toLowerCase()}`, book.id])
+    );
+
+    for (const row of rows) {
+      const key = `${row.title.trim().toLowerCase()}|${(row.author || "").trim().toLowerCase()}`;
+      let bookId = existingBooks.get(key);
+      if (!bookId) {
+        const insertedBooks = await supabaseDbFetch("books", {
+          method: "POST",
+          token: accessToken,
+          body: { title: row.title, author: row.author, updated_at: now },
+          prefer: "return=representation",
+        });
+        bookId = insertedBooks?.[0]?.id;
+        existingBooks.set(key, bookId);
+      }
+      await supabaseDbFetch("quotes", {
+        method: "POST",
+        token: accessToken,
+        body: {
+          book_id: bookId,
+          transcription: row.transcription,
+          page_number: row.pageNumber,
+          created_at: safeDateISOString(row.createdAt),
+          updated_at: now,
+        },
+        prefer: "return=minimal",
+      });
+      await supabaseDbFetch(`books?id=eq.${bookId}`, {
+        method: "PATCH",
+        token: accessToken,
+        body: { updated_at: now },
+        prefer: "return=minimal",
+      });
+    }
+  }
+
+  const saveQuote = async () => {
+    if (!transcription.trim()) {
+      showStatus("本文を入力してください", "error");
+      return;
+    }
+    if (!isLocalDemo && !accessToken) {
+      showStatus("ログインしてください", "error");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      if (isLocalDemo) {
+        saveQuoteLocally();
+        return;
+      }
+
+      const now = new Date().toISOString();
+      if (editingQuoteId) {
+        await supabaseDbFetch(`quotes?id=eq.${editingQuoteId}`, {
+          method: "PATCH",
+          token: accessToken,
+          body: { transcription, page_number: pageNumber, updated_at: now },
+          prefer: "return=minimal",
+        });
+        await supabaseDbFetch(`books?id=eq.${selectedBookId}`, {
+          method: "PATCH",
+          token: accessToken,
+          body: { updated_at: now },
+          prefer: "return=minimal",
+        });
+        showStatus("編集を保存しました");
+        setView("book-detail");
+      } else {
+        let bookId = selectedBookId;
+        let newBookForDaily = null;
+        if (selectedBookId === "new") {
+          if (!title.trim()) throw new Error("書名を入力してください");
+          const insertedBooks = await supabaseDbFetch("books", {
+            method: "POST",
+            token: accessToken,
+            body: { title, author },
+            prefer: "return=representation",
+          });
+          const insertedBook = insertedBooks?.[0];
+          bookId = insertedBook.id;
+          newBookForDaily = toCamelBook(insertedBook);
+        }
+        const insertedQuotes = await supabaseDbFetch("quotes", {
+          method: "POST",
+          token: accessToken,
+          body: { book_id: bookId, transcription, page_number: pageNumber },
+          prefer: "return=representation",
+        });
+        await supabaseDbFetch(`books?id=eq.${bookId}`, {
+          method: "PATCH",
+          token: accessToken,
+          body: { updated_at: now },
+          prefer: "return=minimal",
+        });
+        const insertedQuote = toCamelQuote(insertedQuotes?.[0]);
+        if (newBookForDaily) {
+          setDailyQuote({ ...insertedQuote, bookTitle: newBookForDaily.title, bookAuthor: newBookForDaily.author });
+        }
+        showStatus("保存しました");
+        setView("dashboard");
+      }
+      setTranscription("");
+      setPageNumber("");
+      setEditingQuoteId(null);
+      await fetchBooks();
+    } catch (error) {
+      showStatus(error.message, "error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  function saveQuoteLocally() {
+    const now = new Date().toISOString();
+    if (editingQuoteId) {
+      setBooks((prev) => prev.map((book) => book.id === selectedBookId ? {
+        ...book,
+        updatedAt: now,
+        quotes: book.quotes.map((quote) => quote.id === editingQuoteId ? { ...quote, transcription, pageNumber, updatedAt: now } : quote),
+      } : book));
+      showStatus("編集を保存しました / Local Demo");
+      setView("book-detail");
+    } else {
+      const newQuote = { id: uid("quote"), transcription, pageNumber, createdAt: now, updatedAt: now };
+      if (selectedBookId === "new") {
+        if (!title.trim()) throw new Error("書名を入力してください");
+        const newBook = { id: uid("book"), title, author, quotes: [newQuote], createdAt: now, updatedAt: now };
+        setBooks((prev) => [newBook, ...prev]);
+        setDailyQuote({ ...newQuote, bookId: newBook.id, bookTitle: newBook.title, bookAuthor: newBook.author });
+      } else {
+        setBooks((prev) => prev.map((book) => book.id === selectedBookId ? { ...book, quotes: [...book.quotes, newQuote], updatedAt: now } : book));
+      }
+      showStatus("保存しました / Local Demo");
+      setView("dashboard");
+    }
+    setTranscription("");
+    setPageNumber("");
+    setEditingQuoteId(null);
+    setLoading(false);
+  }
+
+  const deleteQuote = async (bookId, quoteId) => {
+    setLoading(true);
+    try {
+      if (isLocalDemo) {
+        setBooks((prev) => prev.map((book) => book.id === bookId ? { ...book, quotes: book.quotes.filter((quote) => quote.id !== quoteId) } : book));
+      } else {
+        await supabaseDbFetch(`quotes?id=eq.${quoteId}`, { method: "DELETE", token: accessToken, prefer: "return=minimal" });
+        await fetchBooks();
+      }
+      showStatus("メモを削除しました");
+    } catch (error) {
+      showStatus(error.message, "error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const deleteBook = async (bookId) => {
+    setLoading(true);
+    try {
+      if (isLocalDemo) {
+        setBooks((prev) => prev.filter((book) => book.id !== bookId));
+      } else {
+        await supabaseDbFetch(`books?id=eq.${bookId}`, { method: "DELETE", token: accessToken, prefer: "return=minimal" });
+        await fetchBooks();
+      }
+      setSelectedBook(null);
+      setView("library");
+      showStatus("本を削除しました");
+    } catch (error) {
+      showStatus(error.message, "error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const applyHighlight = () => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    if (start === end) {
+      showStatus("ハイライトしたい範囲を選択してください", "error");
+      return;
+    }
+    setTranscription(toggleMarkdownBold(transcription, start, end));
+  };
+
+  const startEditQuote = (book, quote) => {
+    setSelectedBook(book);
+    setSelectedBookId(book.id);
+    setTranscription(quote.transcription);
+    setPageNumber(quote.pageNumber || "");
+    setEditingQuoteId(quote.id);
+    setView("add");
+  };
+
+  const exportToCSV = () => {
+    if (books.length === 0) return;
+    const csvContent = buildCSV(books);
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `shiori_export_${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    showStatus("CSVをダウンロードしました");
+  };
+
+  const renderFormattedText = (text, size = "text-xl") => {
+    if (!text) return null;
+    const parts = text.split(/(\*\*.*?\*\*)/g);
+    return (
+      <p className={`${size} font-serif leading-relaxed ${ui.body} whitespace-pre-wrap`}>
+        {parts.map((part, i) => part.startsWith("**") && part.endsWith("**") ? (
+          <span key={i} className={`${ui.highlight} font-bold border-b-2 px-1`}>{part.slice(2, -2)}</span>
+        ) : <span key={i}>{part}</span>)}
+      </p>
+    );
+  };
+
+  if (!session) {
+    return (
+      <div className={`min-h-screen ${ui.app} font-sans flex items-center justify-center p-6 transition-colors duration-300`}>
+        {statusMsg && <Toast statusMsg={statusMsg} />}
+        <div className={`w-full max-w-md ${ui.panel} rounded-[3rem] p-8 shadow-2xl border space-y-6`}>
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="w-12 h-12 bg-indigo-600 rounded-2xl flex items-center justify-center text-white shadow-lg shadow-indigo-900/20">
+                <Icon name="Bookmark" className="w-6 h-6" fill="currentColor" />
+              </div>
+              <div>
+                <h1 className={`text-2xl font-black italic tracking-tighter uppercase ${ui.title}`}>Shiori</h1>
+                <p className={`text-xs font-bold ${ui.muted} uppercase tracking-widest`}>Supabase Text DB</p>
+              </div>
+            </div>
+            <ThemeButton theme={theme} toggleTheme={toggleTheme} isDark={isDark} />
+          </div>
+
+          {!HAS_SUPABASE_CONFIG && (
+            <div className="bg-amber-50 border border-amber-100 text-amber-700 rounded-2xl p-4 text-xs font-bold leading-relaxed">
+              VITE_SUPABASE_URL と VITE_SUPABASE_ANON_KEY が未設定です。CanvasではLocal Demoとして動作します。
+            </div>
+          )}
+
+          <div className="space-y-3">
+            <input value={email} onChange={(e) => setEmail(e.target.value)} type="email" className={`w-full px-5 py-4 rounded-2xl border-2 outline-none font-bold text-sm ${ui.input}`} placeholder="email@example.com" />
+            <input value={password} onChange={(e) => setPassword(e.target.value)} type="password" className={`w-full px-5 py-4 rounded-2xl border-2 outline-none font-bold text-sm ${ui.input}`} placeholder="password" />
+          </div>
+
+          <button onClick={handleAuth} disabled={loading} className="w-full bg-indigo-600 text-white py-5 rounded-[2rem] font-black shadow-2xl active:scale-95 transition-all flex items-center justify-center gap-3 disabled:opacity-50">
+            {loading ? <Icon name="Loader2" className="w-5 h-5 animate-spin" /> : <Icon name="User" className="w-5 h-5" />}
+            {authMode === "signin" ? "ログイン" : "新規登録"}
+          </button>
+          <button onClick={() => setAuthMode(authMode === "signin" ? "signup" : "signin")} className="w-full text-xs font-black text-indigo-500 uppercase tracking-widest">
+            {authMode === "signin" ? "アカウントを作成する" : "ログインに戻る"}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`min-h-screen ${ui.app} pb-36 font-sans transition-colors duration-300`}>
+      {statusMsg && <Toast statusMsg={statusMsg} />}
+
+      <header className={`${ui.header} backdrop-blur-xl sticky top-0 z-30 px-6 py-5 flex justify-between items-center border-b transition-colors duration-300`}>
+        <div className="flex items-center gap-2.5">
+          <div className="w-9 h-9 bg-indigo-600 rounded-xl flex items-center justify-center text-white shadow-lg shadow-indigo-900/20">
+            <Icon name="Bookmark" className="w-5 h-5" fill="currentColor" />
+          </div>
+          <div>
+            <h1 className={`text-xl font-black italic tracking-tighter uppercase leading-none ${ui.title}`}>Shiori</h1>
+            <p className={`text-[9px] font-black ${ui.subtle} uppercase tracking-widest mt-1 flex items-center gap-1`}>
+              <Icon name="Database" className="w-3 h-3" />
+              {isLocalDemo ? "Local Demo" : "Supabase"}
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <ThemeButton theme={theme} toggleTheme={toggleTheme} isDark={isDark} />
+          <button onClick={pickRandomQuote} className={`${ui.muted} p-2 hover:text-indigo-500 transition-colors`} aria-label="新しい一節を表示">
+            <Icon name="RefreshCw" className="w-5 h-5" />
+          </button>
+          {!isLocalDemo && (
+            <button onClick={logout} className={`${ui.muted} p-2 hover:text-red-500 transition-colors`} aria-label="ログアウト">
+              <Icon name="LogOut" className="w-5 h-5" />
+            </button>
+          )}
+        </div>
+      </header>
+
+      <main className="max-w-xl mx-auto p-6">
+        {isLocalDemo && (
+          <div className="mb-6 bg-amber-50 border border-amber-100 text-amber-700 rounded-3xl p-5 text-xs font-bold leading-relaxed">
+            Supabase環境変数が未設定のため、現在はブラウザ内のLocal Demoに保存しています。Webアプリ化するときはVercelなどに環境変数を設定してください。
+          </div>
+        )}
+
+        {view === "dashboard" && (
+          <div className="space-y-10">
+            <section className="space-y-6">
+              <div className="flex items-center justify-between px-1">
+                <h2 className={`text-2xl font-black italic ${ui.title}`}>ハイライト</h2>
+                <span className={`text-[10px] font-black ${ui.subtle} uppercase tracking-widest ${ui.soft} border px-3 py-1 rounded-full`}>Auto / 5 min</span>
+              </div>
+
+              {dailyQuote ? (
+                <div className={`group relative ${ui.panel} rounded-[3rem] p-10 shadow-2xl border min-h-[420px] flex flex-col justify-between transition-all hover:scale-[1.01]`}>
+                  <div className="space-y-6">
+                    <Icon name="Sparkles" className="w-8 h-8 text-indigo-300" />
+                    {renderFormattedText(dailyQuote.transcription, "text-2xl")}
+                  </div>
+                  <div className={`mt-12 pt-8 border-t ${isDark ? "border-slate-800" : "border-slate-100"} flex justify-between items-end`}>
+                    <div className="max-w-[70%]">
+                      <h3 className={`text-xl font-black ${ui.title} leading-tight`}>{dailyQuote.bookTitle}</h3>
+                      <p className="text-xs font-bold text-indigo-500 mt-1.5 uppercase tracking-wider">{dailyQuote.bookAuthor || "Unknown Author"}</p>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <button onClick={() => {
+                        const book = books.find((item) => item.id === dailyQuote.bookId);
+                        if (book) startEditQuote(book, dailyQuote);
+                      }} className={`${ui.soft} p-3 ${ui.muted} rounded-2xl hover:text-indigo-500 transition-colors`} aria-label="引用を編集">
+                        <Icon name="Edit3" className="w-4 h-4" />
+                      </button>
+                      <span className={`text-sm font-mono font-bold ${ui.subtle} italic`}>p.{dailyQuote.pageNumber}</span>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className={`h-72 flex flex-col items-center justify-center ${ui.soft} border-2 border-dashed rounded-[3rem] ${ui.subtle} group hover:border-indigo-300 transition-all`}>
+                  <Icon name="Book" className="w-12 h-12 mb-4 opacity-30 group-hover:text-indigo-300" />
+                  <p className="font-bold text-[10px] tracking-widest uppercase">本を一冊、記録しましょう</p>
+                </div>
+              )}
+            </section>
+
+            <section className="space-y-6">
+              <h2 className={`text-lg font-black italic px-1 ${ui.title}`}>最近の記録</h2>
+              <div className="space-y-3">
+                {books.slice(0, 3).map((book) => (
+                  <button key={book.id} onClick={() => { setSelectedBook(book); setView("book-detail"); }} className={`w-full ${ui.panel} p-5 rounded-3xl border flex items-center gap-4 text-left hover:shadow-lg transition-all active:scale-95`}>
+                    <div className={`${isDark ? "bg-indigo-950 text-indigo-200" : "bg-indigo-50 text-indigo-600"} w-12 h-12 rounded-2xl flex items-center justify-center shrink-0`}><Icon name="Book" className="w-6 h-6" /></div>
+                    <div className="flex-1 min-w-0">
+                      <h4 className={`font-black text-sm truncate ${ui.title}`}>{book.title}</h4>
+                      <p className={`text-[10px] font-bold ${ui.muted} mt-0.5`}>{book.quotes?.length || 0} highlights</p>
+                    </div>
+                    <Icon name="ChevronRight" className={`w-4 h-4 ${ui.subtle}`} />
+                  </button>
+                ))}
+              </div>
+            </section>
+          </div>
+        )}
+
+        {view === "library" && (
+          <div className="space-y-6">
+            <div className="flex items-center justify-between px-1">
+              <h2 className={`text-3xl font-black italic ${ui.title}`}>本棚</h2>
+              <div className="flex items-center gap-2">
+                <label className={`${ui.panel} flex items-center gap-2 px-4 py-2 rounded-2xl border text-[10px] font-black uppercase tracking-widest ${ui.muted} hover:text-indigo-500 transition-all shadow-sm cursor-pointer`}>
+                  <Icon name="Upload" className="w-3.5 h-3.5" />Import CSV
+                  <input ref={csvInputRef} type="file" accept=".csv,text/csv" className="hidden" onChange={handleCSVImport} />
+                </label>
+                <button onClick={exportToCSV} className={`${ui.panel} flex items-center gap-2 px-4 py-2 rounded-2xl border text-[10px] font-black uppercase tracking-widest ${ui.muted} hover:text-indigo-500 transition-all shadow-sm`}>
+                  <Icon name="Download" className="w-3.5 h-3.5" />Export CSV
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 gap-4">
+              {books.length > 0 ? books.map((book) => (
+                <div key={book.id} onClick={() => { setSelectedBook(book); setView("book-detail"); }} className={`${ui.panel} p-6 rounded-[2.5rem] shadow-sm border group hover:border-indigo-300 hover:shadow-xl transition-all cursor-pointer`}>
+                  <div className="flex justify-between items-start">
+                    <div className="flex-1 pr-4">
+                      <h3 className={`font-black text-xl ${ui.title} group-hover:text-indigo-500 transition-colors`}>{book.title}</h3>
+                      <p className={`text-xs font-bold ${ui.muted} mt-1 uppercase tracking-wider`}>{book.author || "Unknown Author"}</p>
+                    </div>
+                    <div className={`${ui.soft} px-3 py-2 rounded-2xl text-center border`}>
+                      <span className={`block text-lg font-black ${ui.title} leading-none`}>{book.quotes?.length || 0}</span>
+                      <span className={`text-[8px] font-black ${ui.muted} uppercase tracking-tighter`}>Notes</span>
+                    </div>
+                  </div>
+                </div>
+              )) : (
+                <div className="py-20 text-center space-y-4">
+                  <Icon name="History" className={`w-12 h-12 mx-auto ${ui.subtle}`} />
+                  <p className={`font-bold ${ui.subtle} uppercase text-xs tracking-widest`}>記録がまだありません</p>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {view === "book-detail" && selectedBookLive && (
+          <div className="space-y-8">
+            <button onClick={() => setView("library")} className={`flex items-center gap-2 ${ui.muted} hover:text-indigo-500 transition-colors`}>
+              <Icon name="ChevronRight" className="w-5 h-5 rotate-180" />
+              <span className="text-xs font-black uppercase tracking-widest">Back to Library</span>
+            </button>
+
+            <div className="flex justify-between items-end px-2">
+              <div className="max-w-[80%]">
+                <h2 className={`text-3xl font-black ${ui.title} italic leading-tight`}>{selectedBookLive.title}</h2>
+                <p className="text-sm font-bold text-indigo-500 mt-2 uppercase tracking-widest">{selectedBookLive.author || "Unknown Author"}</p>
+              </div>
+              <button onClick={() => deleteBook(selectedBookLive.id)} className={`${ui.subtle} p-3 hover:text-red-500 hover:bg-red-50 rounded-2xl transition-all`} aria-label="本を削除">
+                <Icon name="Trash2" className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-6 mt-10">
+              {selectedBookLive.quotes?.slice().reverse().map((quote) => (
+                <div key={quote.id} className={`${ui.panel} p-8 rounded-[2.5rem] border shadow-sm relative overflow-hidden group`}>
+                  <div className={`absolute top-0 right-0 w-24 h-24 ${isDark ? "bg-slate-800/40" : "bg-slate-50/50"} -rotate-45 translate-x-12 -translate-y-12`} />
+                  <div className="relative">
+                    <div className={`flex items-center gap-3 mb-6 ${ui.subtle}`}>
+                      <Icon name="Clock" className="w-3.5 h-3.5" />
+                      <span className="text-[10px] font-bold font-mono">{new Date(quote.createdAt).toLocaleDateString()}</span>
+                      <span className={`${ui.soft} text-[10px] font-bold ml-auto px-2 py-1 rounded-lg border`}>p.{quote.pageNumber}</span>
+                    </div>
+                    {renderFormattedText(quote.transcription, "text-lg")}
+                    <div className="mt-8 flex items-center gap-2 justify-end opacity-100 sm:opacity-0 group-hover:opacity-100 transition-opacity">
+                      <button onClick={() => startEditQuote(selectedBookLive, quote)} className={`${ui.soft} p-3 ${ui.muted} rounded-2xl hover:text-indigo-500 transition-all`} aria-label="引用を編集"><Icon name="Edit3" className="w-4 h-4" /></button>
+                      <button onClick={() => deleteQuote(selectedBookLive.id, quote.id)} className={`${ui.soft} p-3 ${ui.muted} rounded-2xl hover:text-red-500 transition-all`} aria-label="引用を削除"><Icon name="Trash2" className="w-4 h-4" /></button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {view === "add" && (
+          <div className="space-y-6 pb-12">
+            <div className="flex items-center gap-4 px-1">
+              <button onClick={() => { setView(editingQuoteId ? "book-detail" : "dashboard"); setEditingQuoteId(null); setTranscription(""); setPageNumber(""); }} className={`${ui.panel} p-3 border rounded-2xl shadow-sm ${ui.muted}`} aria-label="戻る">
+                <Icon name="ChevronRight" className="w-5 h-5 rotate-180" />
+              </button>
+              <h2 className={`text-xl font-black italic ${ui.title}`}>{editingQuoteId ? "内容を編集" : "記録を確認"}</h2>
+            </div>
+
+            <div className={`${ui.panel} p-8 rounded-[3rem] shadow-2xl border space-y-8`}>
+              {!editingQuoteId && (
+                <div className="space-y-4">
+                  <div className="relative">
+                    <select value={selectedBookId} onChange={(e) => setSelectedBookId(e.target.value)} className={`w-full p-5 rounded-2xl border-2 font-bold text-sm outline-none transition-all appearance-none cursor-pointer pr-12 ${ui.input}`}>
+                      <option value="new">+ 新しい本として登録</option>
+                      {books.map((book) => <option key={book.id} value={book.id}>{book.title}</option>)}
+                    </select>
+                    <Icon name="ChevronRight" className={`w-5 h-5 absolute right-5 top-1/2 -translate-y-1/2 rotate-90 ${ui.subtle} pointer-events-none`} />
+                  </div>
+
+                  {selectedBookId === "new" && (
+                    <div className="space-y-3">
+                      <div className="space-y-1 px-1">
+                        <label className={`text-[10px] font-black ${ui.muted} uppercase tracking-widest`}>Book Title</label>
+                        <input type="text" value={title} onChange={(e) => setTitle(e.target.value)} className={`w-full px-5 py-4 rounded-2xl border-2 outline-none font-bold text-sm ${ui.input}`} placeholder="書名" />
+                      </div>
+                      <div className="space-y-1 px-1">
+                        <label className={`text-[10px] font-black ${ui.muted} uppercase tracking-widest`}>Author</label>
+                        <input type="text" value={author} onChange={(e) => setAuthor(e.target.value)} className={`w-full px-5 py-4 rounded-2xl border-2 outline-none font-bold text-sm ${ui.input}`} placeholder="著者" />
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="space-y-1 px-1">
+                <label className={`text-[10px] font-black ${ui.muted} uppercase tracking-widest`}>Page</label>
+                <input type="text" value={pageNumber} onChange={(e) => setPageNumber(e.target.value)} className={`w-full px-5 py-4 rounded-2xl border-2 outline-none text-sm font-bold ${ui.input}`} placeholder="ページ番号" />
+              </div>
+
+              <div className="space-y-4">
+                <div className="flex justify-between items-center px-1">
+                  <label className={`text-[10px] font-black ${ui.muted} uppercase tracking-widest`}>Transcription</label>
+                  <button onClick={applyHighlight} className="flex items-center gap-2 bg-indigo-600 text-white px-4 py-2 rounded-full text-[11px] font-black shadow-lg shadow-indigo-900/20 active:scale-95 transition-all">
+                    <Icon name="Highlighter" className="w-3.5 h-3.5" />ハイライト
+                  </button>
+                </div>
+                <textarea ref={textareaRef} value={transcription} onChange={(e) => setTranscription(e.target.value)} className={`w-full px-8 py-8 rounded-[2.5rem] border-2 h-80 outline-none font-serif leading-relaxed text-lg resize-none shadow-inner transition-all ${ui.input}`} placeholder="読み取り内容、または引用文を入力" />
+              </div>
+
+              <button onClick={saveQuote} disabled={loading} className="w-full bg-indigo-600 text-white py-6 rounded-[2rem] font-black shadow-2xl active:scale-95 transition-all flex items-center justify-center gap-3 disabled:opacity-50">
+                {loading ? <Icon name="Loader2" className="w-6 h-6 animate-spin" /> : editingQuoteId ? <Icon name="Check" className="w-6 h-6" /> : <Icon name="Save" className="w-6 h-6" />}
+                {editingQuoteId ? "編集内容を適用" : "保存する"}
+              </button>
+            </div>
+          </div>
+        )}
+      </main>
+
+      <nav className="fixed bottom-0 left-0 right-0 px-8 pb-10 pt-4 z-40 flex justify-center pointer-events-none">
+        <div className={`${ui.nav} backdrop-blur-2xl border rounded-[3rem] shadow-2xl flex justify-between items-center px-6 py-4 pointer-events-auto max-w-sm w-full`}>
+          <button onClick={() => setView("dashboard")} className={`p-4 rounded-[2rem] transition-all ${view === "dashboard" ? ui.navActive : ui.navInactive}`} aria-label="ダッシュボード">
+            <Icon name="LayoutDashboard" className="w-6 h-6" />
+          </button>
+          <div className="relative -top-12">
+            <label className={`w-20 h-20 bg-indigo-600 rounded-[2.5rem] flex items-center justify-center text-white shadow-2xl shadow-indigo-500/40 cursor-pointer active:scale-90 transition-all border-4 ${isDark ? "border-slate-950" : "border-[#FDFDFF]"}`}>
+              <Icon name="Camera" className="w-9 h-9" strokeWidth={2.5} />
+              <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={handleFileSelect} />
+            </label>
+          </div>
+          <button onClick={() => setView("library")} className={`p-4 rounded-[2rem] transition-all ${view === "library" || view === "book-detail" ? ui.navActive : ui.navInactive}`} aria-label="本棚">
+            <Icon name="Book" className="w-6 h-6" />
+          </button>
+        </div>
+      </nav>
+
+      {loading && (
+        <div className={`fixed inset-0 ${isDark ? "bg-slate-950/80" : "bg-white/80"} backdrop-blur-md z-[60] flex flex-col items-center justify-center`}>
+          <div className="relative">
+            <Icon name="Loader2" className="w-16 h-16 text-indigo-500 animate-spin" />
+            <Icon name="Sparkles" className="w-6 h-6 text-indigo-400 absolute -top-2 -right-2 animate-bounce" />
+          </div>
+          <p className={`mt-6 text-xs font-black ${ui.muted} uppercase tracking-[0.2em] animate-pulse`}>Saving / Importing...</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Toast({ statusMsg }) {
+  return (
+    <div className={`fixed top-6 left-1/2 -translate-x-1/2 z-[100] w-[90%] max-w-sm px-6 py-4 rounded-2xl shadow-2xl flex items-center gap-3 ${statusMsg.type === "error" ? "bg-red-600 text-white" : "bg-slate-900 text-white"}`}>
+      <Icon name={statusMsg.type === "error" ? "AlertCircle" : "CheckCircle2"} className={`w-5 h-5 ${statusMsg.type === "error" ? "" : "text-emerald-400"}`} />
+      <span className="text-xs font-bold">{statusMsg.text}</span>
+    </div>
+  );
+}
+
+function ThemeButton({ theme, toggleTheme, isDark }) {
+  return (
+    <button
+      onClick={toggleTheme}
+      className={`${isDark ? "bg-slate-800 text-amber-300 hover:bg-slate-700" : "bg-slate-100 text-slate-500 hover:bg-slate-200"} p-2 rounded-2xl transition-colors`}
+      aria-label={theme === "dark" ? "ライトモードに切り替え" : "ダークモードに切り替え"}
+      title={theme === "dark" ? "Light mode" : "Dark mode"}
+    >
+      <Icon name={theme === "dark" ? "Sun" : "Moon"} className="w-5 h-5" />
+    </button>
+  );
+}
